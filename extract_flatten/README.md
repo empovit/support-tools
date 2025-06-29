@@ -8,7 +8,7 @@ Extracts and flattens archives or directories into a single-level directory stru
 - **Recursive directory processing**: Flattens nested directory structures
 - **Smart deduplication**: Uses path-based hashes to handle duplicate filenames
 - **File type transformation**: Automatically adds `.txt` extension to config files
-- **Empty file filtering**: Skips empty files automatically
+- **Smart file filtering**: Skips empty files and OS metadata files automatically
 - **Safety checks**: Aborts if output directory is not empty
 - **Mapping documentation**: Creates `.path_mappings.txt` showing hash-to-path relationships
 
@@ -64,7 +64,11 @@ python3 extract_flatten.py -s file.zip -o out
    - `config.yaml` from `dir1/` becomes `a1b2c3d4_config.yaml.txt`
    - `config.yaml` from `dir2/` becomes `e5f6g7h8_config.yaml.txt`
 
-3. **Empty files**: Automatically skipped and reported
+3. **File filtering**: Automatically skipped and reported:
+   - **Empty files**: Zero-byte files
+   - **macOS metadata**: `__MACOSX/` directories, `._*` files, `.DS_Store`, `.Trashes`, etc.
+   - **Windows metadata**: `Thumbs.db`, `desktop.ini`, `$RECYCLE.BIN`
+   - **Linux metadata**: `.directory` (KDE folder settings)
 
 ## Output
 
@@ -87,15 +91,20 @@ The tool creates:
 
 **Customer support use cases:**
 ```bash
-# Extract GPU operator logs
+# Extract GPU operator logs (filters out macOS metadata automatically)
 python3 extract_flatten.py -s nvidia-gpu-operator_20250613_1433.tar.gz -o gpu-logs-extracted
 
-# Flatten support bundle
+# Flatten support bundle (skips OS metadata and empty files)
 python3 extract_flatten.py -s support-bundle.zip -o support-bundle-flat
 
 # Process debugging info from container
 python3 extract_flatten.py -s debug-info.tar.xz -o debug-flat
 ```
+
+**Benefits for support workflows:**
+- **Clean output**: OS metadata files are filtered out for focused analysis
+- **Reduced noise**: Eliminates macOS `__MACOSX/` directories and Windows `Thumbs.db` files
+- **Faster analysis**: Support engineers see only relevant files (logs, configs, status files)
 
 **Output structure:**
 ```
