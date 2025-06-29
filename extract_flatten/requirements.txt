@@ -1,0 +1,8 @@
+# Optional dependencies for extended archive format support
+# Install with: pip install -r requirements.txt
+
+# 7ZIP support (.7z files)
+py7zr>=0.20.0
+
+# RAR support (.rar files)
+rarfile>=4.0

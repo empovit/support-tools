@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""
+Archive/Directory Flattener Script
+
+This script takes either a directory or an archive file as input and:
+1. Extracts all files recursively into a flat directory structure
+2. Deduplicates filenames using prepended path hashes
+3. Adds .txt extension to specific file types
+4. Skips empty files
+5. Supports popular Linux archive formats
+6. Creates mapping file showing hash-to-path relationships
+7. Aborts if output directory is not empty
+"""
+
+import os
+import sys
+import shutil
+import argparse
+import tempfile
+import zipfile
+import tarfile
+import gzip
+import hashlib
+from pathlib import Path
+
+# Try to import optional libraries for additional archive support
+try:
+    import py7zr
+    HAS_7Z = True
+except ImportError:
+    HAS_7Z = False
+
+try:
+    import rarfile
+    HAS_RAR = True
+except ImportError:
+    HAS_RAR = False
+
+
+class ArchiveExtractor:
+    """Handles extraction and flattening of archives and directories."""
+
+    # Extensions that should get .txt appended
+    TXT_EXTENSIONS = {'.yaml', '.yml', '.list', '.log', '.descr', '.status', '.labels'}
+
+    def __init__(self, source_path, output_dir):
+        self.source_path = Path(source_path)
+        self.output_dir = Path(output_dir)
+
+        # Check if output directory exists and is not empty
+        if self.output_dir.exists():
+            # Check if directory is not empty
+            try:
+                next(self.output_dir.iterdir())
+                # If we get here, directory is not empty
+                raise ValueError(f"Output directory is not empty: {self.output_dir}\n"
+                               f"Please use an empty directory or remove existing files.")
+            except StopIteration:
+                # Directory is empty, we can proceed
+                pass
+        else:
+            # Create the directory
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.hash_to_path = {}  # Track hash to source path mapping
+
+    def is_archive(self, path):
+        """Check if the given path is a supported archive format."""
+        path = Path(path)
+        suffix_lower = path.suffix.lower()
+
+        # Check for compound extensions like .tar.gz
+        if len(path.suffixes) >= 2:
+            compound = ''.join(path.suffixes[-2:]).lower()
+            if compound in {'.tar.gz', '.tar.bz2', '.tar.xz'}:
+                return True
+
+        # Check single extensions
+        archive_extensions = {'.zip', '.tar', '.tgz', '.tbz2', '.txz', '.gz', '.7z', '.rar'}
+        return suffix_lower in archive_extensions
+
+    def extract_archive(self, archive_path, temp_dir):
+        """Extract archive to temporary directory."""
+        archive_path = Path(archive_path)
+        suffix_lower = archive_path.suffix.lower()
+
+        # Handle compound extensions
+        if len(archive_path.suffixes) >= 2:
+            compound = ''.join(archive_path.suffixes[-2:]).lower()
+            if compound in {'.tar.gz', '.tar.bz2', '.tar.xz'}:
+                suffix_lower = compound
+
+        print(f"Extracting {archive_path.name}...")
+
+        try:
+            if suffix_lower == '.zip':
+                with zipfile.ZipFile(archive_path, 'r') as zf:
+                    zf.extractall(temp_dir)
+
+            elif suffix_lower in {'.tar', '.tar.gz', '.tar.bz2', '.tar.xz', '.tgz', '.tbz2', '.txz'}:
+                with tarfile.open(archive_path, 'r:*') as tf:
+                    tf.extractall(temp_dir)
+
+            elif suffix_lower == '.7z':
+                if HAS_7Z:
+                    with py7zr.SevenZipFile(archive_path, mode='r') as szf:
+                        szf.extractall(temp_dir)
+                else:
+                    raise ValueError(f"7ZIP support requires the 'py7zr' library. Install with: pip install py7zr")
+
+            elif suffix_lower == '.rar':
+                if HAS_RAR:
+                    with rarfile.RarFile(archive_path, 'r') as rf:
+                        rf.extractall(temp_dir)
+                else:
+                    raise ValueError(f"RAR support requires the 'rarfile' library. Install with: pip install rarfile")
+
+            elif suffix_lower == '.gz':
+                # Handle standalone .gz files (not .tar.gz which is handled above)
+                decompressed_name = archive_path.stem  # Remove .gz extension
+                decompressed_path = Path(temp_dir) / decompressed_name
+
+                with gzip.open(archive_path, 'rb') as gz_file:
+                    with open(decompressed_path, 'wb') as out_file:
+                        shutil.copyfileobj(gz_file, out_file)
+
+                # Check if the decompressed file is another archive
+                if self.is_archive(decompressed_path):
+                    # Recursively extract the decompressed archive
+                    nested_temp_dir = Path(temp_dir) / "nested"
+                    nested_temp_dir.mkdir(exist_ok=True)
+                    self.extract_archive(decompressed_path, nested_temp_dir)
+                    # Remove the intermediate decompressed file
+                    decompressed_path.unlink()
+
+            else:
+                raise ValueError(f"Unsupported archive format: {suffix_lower}")
+
+        except Exception as e:
+            print(f"Error extracting {archive_path}: {e}")
+            raise
+
+    def get_unique_filename(self, original_name, source_path_str=""):
+        """Generate a unique filename using prepended path hash for deduplication."""
+        base_name = Path(original_name).stem
+        extension = Path(original_name).suffix
+
+        # Add .txt to specific extensions
+        if extension.lower() in self.TXT_EXTENSIONS:
+            extension += '.txt'
+
+        # Create filename with prepended path hash for deduplication
+        if source_path_str:
+            # Include hash of the source path for uniqueness (prepended)
+            path_hash = hashlib.md5(source_path_str.encode()).hexdigest()[:8]
+            unique_filename = f"{path_hash}_{base_name}{extension}"
+            # Store mapping for later reference
+            self.hash_to_path[path_hash] = source_path_str
+        else:
+            # For files in root directory, use original name
+            unique_filename = f"{base_name}{extension}"
+
+        return unique_filename
+
+    def write_mapping_file(self):
+        """Write hash-to-path mapping to auxiliary file."""
+        if not self.hash_to_path:
+            return
+
+        mapping_file = self.output_dir / ".path_mappings.txt"
+
+        with open(mapping_file, 'w', encoding='utf-8') as f:
+            f.write("# Hash to Source Path Mapping\n")
+            f.write("# Generated by extract_flatten.py\n")
+            f.write("# Format: HASH -> SOURCE_PATH\n\n")
+
+            for path_hash, source_path in sorted(self.hash_to_path.items()):
+                f.write(f"{path_hash} -> {source_path}\n")
+
+        print(f"\nPath mapping written to: {mapping_file}")
+
+        # Also print the mappings to console
+        print("\nHash to Path Mappings:")
+        for path_hash, source_path in sorted(self.hash_to_path.items()):
+            print(f"  {path_hash} -> {source_path}")
+
+    def process_files(self, source_dir):
+        """Process all files in the source directory recursively."""
+        source_dir = Path(source_dir)
+        files_processed = 0
+        files_skipped = 0
+
+        print(f"Processing files from {source_dir}...")
+        print(f"Recursively scanning all subdirectories...")
+
+        # Use rglob to recursively find all files in subdirectories
+        for file_path in source_dir.rglob('*'):
+            if file_path.is_file():
+                try:
+                    # Skip empty files
+                    if file_path.stat().st_size == 0:
+                        files_skipped += 1
+                        print(f"Skipping empty file: {file_path.relative_to(source_dir)}")
+                        continue
+
+                    # Get relative path for context
+                    rel_path = file_path.relative_to(source_dir)
+                    source_path_str = str(rel_path.parent) if rel_path.parent != Path('.') else ""
+
+                    # Generate unique filename
+                    unique_name = self.get_unique_filename(file_path.name, source_path_str)
+                    dest_path = self.output_dir / unique_name
+
+                    # Copy file
+                    shutil.copy2(file_path, dest_path)
+                    files_processed += 1
+
+                    # Print progress for debugging
+                    print(f"Processed: {rel_path} -> {unique_name}")
+
+                    if files_processed % 100 == 0:
+                        print(f"Processed {files_processed} files...")
+
+                except Exception as e:
+                    print(f"Error processing {file_path}: {e}")
+                    files_skipped += 1
+
+        print(f"Processing complete: {files_processed} files processed, {files_skipped} files skipped")
+
+        # Write mapping file
+        self.write_mapping_file()
+
+        return files_processed, files_skipped
+
+    def run(self):
+        """Main execution method."""
+        if not self.source_path.exists():
+            raise FileNotFoundError(f"Source path does not exist: {self.source_path}")
+
+        if self.source_path.is_dir():
+            print(f"Processing directory: {self.source_path}")
+            return self.process_files(self.source_path)
+
+        elif self.is_archive(self.source_path):
+            print(f"Processing archive: {self.source_path}")
+
+            # Create temporary directory for extraction
+            with tempfile.TemporaryDirectory() as temp_dir:
+                self.extract_archive(self.source_path, temp_dir)
+                return self.process_files(temp_dir)
+        else:
+            raise ValueError(f"Source is neither a directory nor a supported archive: {self.source_path}")
+
+
+def main():
+    """Main function with argument parsing."""
+    parser = argparse.ArgumentParser(
+        description="Extract and flatten archives or directories",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s -s /path/to/archive.zip -o output_dir
+  %(prog)s -s /path/to/directory -o output_dir
+  %(prog)s --source archive.tar.gz --output ./extracted
+  %(prog)s -s ~/docs -o ./flattened -v
+
+Supported archive formats:
+  - ZIP (.zip)
+  - TAR (.tar, .tar.gz, .tar.bz2, .tar.xz, .tgz, .tbz2, .txz)
+  - GZIP (.gz) - standalone compressed files
+  - 7ZIP (.7z) - requires py7zr package
+  - RAR (.rar) - requires rarfile package
+
+Files with these extensions will get .txt appended:
+  yaml, yml, list, log, descr, status, labels
+
+Notes:
+  - Output directory must be empty (script will abort if not)
+  - Hash-to-path mappings are saved to .path_mappings.txt
+  - File names are prefixed with 8-character path hashes for deduplication
+        """
+    )
+
+    parser.add_argument('-s', '--source', required=True, metavar='SRC', help='Source directory or archive file')
+    parser.add_argument('-o', '--output', required=True, metavar='OUT', help='Output directory for flattened files')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
+
+    args = parser.parse_args()
+
+    try:
+        extractor = ArchiveExtractor(args.source, args.output)
+        processed, skipped = extractor.run()
+
+        print(f"\nSummary:")
+        print(f"  Files processed: {processed}")
+        print(f"  Files skipped: {skipped}")
+        print(f"  Output directory: {Path(args.output).absolute()}")
+
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
