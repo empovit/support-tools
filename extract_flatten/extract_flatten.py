@@ -6,13 +6,12 @@ This script takes either a directory or an archive file as input and:
 1. Extracts all files recursively into a flat directory structure
 2. Deduplicates filenames using prepended path hashes
 3. Adds .txt extension to specific file types
-4. Skips empty files
+4. Skips empty files and OS metadata files
 5. Supports popular Linux archive formats
 6. Creates mapping file showing hash-to-path relationships
 7. Aborts if output directory is not empty
 """
 
-import os
 import sys
 import shutil
 import argparse
@@ -79,6 +78,51 @@ class ArchiveExtractor:
         archive_extensions = {'.zip', '.tar', '.tgz', '.tbz2', '.txz', '.gz', '.7z', '.rar'}
         return suffix_lower in archive_extensions
 
+    def _extract_zip(self, archive_path, temp_dir):
+        """Extract ZIP archive."""
+        with zipfile.ZipFile(archive_path, 'r') as zf:
+            zf.extractall(temp_dir)
+
+    def _extract_tar(self, archive_path, temp_dir):
+        """Extract TAR archive (including compressed variants)."""
+        with tarfile.open(archive_path, 'r:*') as tf:
+            tf.extractall(temp_dir)
+
+    def _extract_7z(self, archive_path, temp_dir):
+        """Extract 7ZIP archive."""
+        if HAS_7Z:
+            with py7zr.SevenZipFile(archive_path, mode='r') as szf:
+                szf.extractall(temp_dir)
+        else:
+            raise ValueError(f"7ZIP support requires the 'py7zr' library. Install with: pip install py7zr")
+
+    def _extract_rar(self, archive_path, temp_dir):
+        """Extract RAR archive."""
+        if HAS_RAR:
+            with rarfile.RarFile(archive_path, 'r') as rf:
+                rf.extractall(temp_dir)
+        else:
+            raise ValueError(f"RAR support requires the 'rarfile' library. Install with: pip install rarfile")
+
+    def _extract_gz(self, archive_path, temp_dir):
+        """Extract standalone GZIP file."""
+        # Handle standalone .gz files (not .tar.gz which is handled above)
+        decompressed_name = archive_path.stem  # Remove .gz extension
+        decompressed_path = Path(temp_dir) / decompressed_name
+
+        with gzip.open(str(archive_path), 'rb') as gz_file:
+            with open(decompressed_path, 'wb') as out_file:
+                shutil.copyfileobj(gz_file, out_file)
+
+        # Check if the decompressed file is another archive
+        if self.is_archive(decompressed_path):
+            # Recursively extract the decompressed archive
+            nested_temp_dir = Path(temp_dir) / "nested"
+            nested_temp_dir.mkdir(exist_ok=True)
+            self.extract_archive(decompressed_path, nested_temp_dir)
+            # Remove the intermediate decompressed file
+            decompressed_path.unlink()
+
     def extract_archive(self, archive_path, temp_dir):
         """Extract archive to temporary directory."""
         archive_path = Path(archive_path)
@@ -94,45 +138,15 @@ class ArchiveExtractor:
 
         try:
             if suffix_lower == '.zip':
-                with zipfile.ZipFile(archive_path, 'r') as zf:
-                    zf.extractall(temp_dir)
-
+                self._extract_zip(archive_path, temp_dir)
             elif suffix_lower in {'.tar', '.tar.gz', '.tar.bz2', '.tar.xz', '.tgz', '.tbz2', '.txz'}:
-                with tarfile.open(archive_path, 'r:*') as tf:
-                    tf.extractall(temp_dir)
-
+                self._extract_tar(archive_path, temp_dir)
             elif suffix_lower == '.7z':
-                if HAS_7Z:
-                    with py7zr.SevenZipFile(archive_path, mode='r') as szf:
-                        szf.extractall(temp_dir)
-                else:
-                    raise ValueError(f"7ZIP support requires the 'py7zr' library. Install with: pip install py7zr")
-
+                self._extract_7z(archive_path, temp_dir)
             elif suffix_lower == '.rar':
-                if HAS_RAR:
-                    with rarfile.RarFile(archive_path, 'r') as rf:
-                        rf.extractall(temp_dir)
-                else:
-                    raise ValueError(f"RAR support requires the 'rarfile' library. Install with: pip install rarfile")
-
+                self._extract_rar(archive_path, temp_dir)
             elif suffix_lower == '.gz':
-                # Handle standalone .gz files (not .tar.gz which is handled above)
-                decompressed_name = archive_path.stem  # Remove .gz extension
-                decompressed_path = Path(temp_dir) / decompressed_name
-
-                with gzip.open(archive_path, 'rb') as gz_file:
-                    with open(decompressed_path, 'wb') as out_file:
-                        shutil.copyfileobj(gz_file, out_file)
-
-                # Check if the decompressed file is another archive
-                if self.is_archive(decompressed_path):
-                    # Recursively extract the decompressed archive
-                    nested_temp_dir = Path(temp_dir) / "nested"
-                    nested_temp_dir.mkdir(exist_ok=True)
-                    self.extract_archive(decompressed_path, nested_temp_dir)
-                    # Remove the intermediate decompressed file
-                    decompressed_path.unlink()
-
+                self._extract_gz(archive_path, temp_dir)
             else:
                 raise ValueError(f"Unsupported archive format: {suffix_lower}")
 
@@ -184,6 +198,59 @@ class ArchiveExtractor:
         for path_hash, source_path in sorted(self.hash_to_path.items()):
             print(f"  {path_hash} -> {source_path}")
 
+    def _should_skip_file(self, file_path):
+        """Check if file should be skipped (e.g., empty files, OS metadata files)."""
+        # Skip empty files
+        if file_path.stat().st_size == 0:
+            return True
+
+        # Get the file name and path components for checking
+        file_name = file_path.name
+        path_parts = file_path.parts
+
+        # Skip macOS metadata files
+        if '__MACOSX' in path_parts:
+            return True
+
+        # Skip AppleDouble files (resource forks)
+        if file_name.startswith('._'):
+            return True
+
+        # Skip common macOS system files
+        macos_files = {'.DS_Store', '.Trashes', '.fseventsd', '.Spotlight-V100', '.TemporaryItems'}
+        if file_name in macos_files:
+            return True
+
+        # Skip Windows system files
+        windows_files = {'Thumbs.db', 'desktop.ini', '$RECYCLE.BIN'}
+        if file_name in windows_files:
+            return True
+
+        # Skip Linux system files
+        if file_name == '.directory':  # KDE folder settings
+            return True
+
+        return False
+
+    def _process_single_file(self, file_path, source_dir, files_processed):
+        """Process a single file - generate unique name and copy."""
+        # Get relative path for context
+        rel_path = file_path.relative_to(source_dir)
+        source_path_str = str(rel_path.parent) if rel_path.parent != Path('.') else ""
+
+        # Generate unique filename
+        unique_name = self.get_unique_filename(file_path.name, source_path_str)
+        dest_path = self.output_dir / unique_name
+
+        # Copy file
+        shutil.copy2(file_path, dest_path)
+
+        # Print progress for debugging
+        print(f"Processed: {rel_path} -> {unique_name}")
+
+        if files_processed % 100 == 0:
+            print(f"Processed {files_processed} files...")
+
     def process_files(self, source_dir):
         """Process all files in the source directory recursively."""
         source_dir = Path(source_dir)
@@ -198,28 +265,14 @@ class ArchiveExtractor:
             if file_path.is_file():
                 try:
                     # Skip empty files
-                    if file_path.stat().st_size == 0:
+                    if self._should_skip_file(file_path):
                         files_skipped += 1
                         print(f"Skipping empty file: {file_path.relative_to(source_dir)}")
                         continue
 
-                    # Get relative path for context
-                    rel_path = file_path.relative_to(source_dir)
-                    source_path_str = str(rel_path.parent) if rel_path.parent != Path('.') else ""
-
-                    # Generate unique filename
-                    unique_name = self.get_unique_filename(file_path.name, source_path_str)
-                    dest_path = self.output_dir / unique_name
-
-                    # Copy file
-                    shutil.copy2(file_path, dest_path)
+                    # Process the file
+                    self._process_single_file(file_path, source_dir, files_processed + 1)
                     files_processed += 1
-
-                    # Print progress for debugging
-                    print(f"Processed: {rel_path} -> {unique_name}")
-
-                    if files_processed % 100 == 0:
-                        print(f"Processed {files_processed} files...")
 
                 except Exception as e:
                     print(f"Error processing {file_path}: {e}")
@@ -252,8 +305,8 @@ class ArchiveExtractor:
             raise ValueError(f"Source is neither a directory nor a supported archive: {self.source_path}")
 
 
-def main():
-    """Main function with argument parsing."""
+def _create_argument_parser():
+    """Create and configure the argument parser."""
     parser = argparse.ArgumentParser(
         description="Extract and flatten archives or directories",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -278,6 +331,7 @@ Notes:
   - Output directory must be empty (script will abort if not)
   - Hash-to-path mappings are saved to .path_mappings.txt
   - File names are prefixed with 8-character path hashes for deduplication
+  - OS metadata files are automatically filtered out (macOS, Windows, Linux)
         """
     )
 
@@ -285,6 +339,12 @@ Notes:
     parser.add_argument('-o', '--output', required=True, metavar='OUT', help='Output directory for flattened files')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
 
+    return parser
+
+
+def main():
+    """Main function with argument parsing."""
+    parser = _create_argument_parser()
     args = parser.parse_args()
 
     try:
