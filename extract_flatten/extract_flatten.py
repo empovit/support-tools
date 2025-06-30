@@ -19,7 +19,6 @@ import tempfile
 import zipfile
 import tarfile
 import gzip
-import hashlib
 from pathlib import Path
 
 # Try to import optional libraries for additional archive support
@@ -63,7 +62,10 @@ class ArchiveExtractor:
             # Create the directory
             self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.hash_to_path = {}  # Track hash to source path mapping
+        self.path_to_prefix = {}  # Track source path to ordered prefix mapping
+        self.prefix_to_path = {}  # Track ordered prefix to source path mapping (for mapping file)
+        self.used_filenames = set()  # Track used filenames to prevent conflicts
+        self.root_prefix = "00"  # Default root prefix, will be updated during directory mapping
 
     def is_archive(self, path):
         """Check if the given path is a supported archive format."""
@@ -125,6 +127,43 @@ class ArchiveExtractor:
             # Remove the intermediate decompressed file
             decompressed_path.unlink()
 
+    def _build_directory_mapping(self, source_dir):
+        """Pre-scan directories and build ordered prefix mapping."""
+        source_dir = Path(source_dir)
+
+        # Collect all unique directory paths
+        dir_paths = set()
+        for file_path in source_dir.rglob('*'):
+            if file_path.is_file():
+                rel_path = file_path.relative_to(source_dir)
+                dir_path_str = str(rel_path.parent) if rel_path.parent != Path('.') else ""
+                if dir_path_str:  # Only add non-empty paths
+                    dir_paths.add(dir_path_str)
+
+        # Sort directory paths alphabetically
+        sorted_dirs = sorted(dir_paths)
+
+        # Create ordered prefix mapping with zero-padded numbers
+        max_digits = max(2, len(str(len(sorted_dirs))))  # At least 2 digits, more if needed
+
+        for i, dir_path in enumerate(sorted_dirs, 1):  # Start from 1
+            prefix = str(i).zfill(max_digits)
+            self.path_to_prefix[dir_path] = prefix
+            self.prefix_to_path[prefix] = dir_path
+
+        # Add root directory mapping for completeness in mapping file
+        root_prefix = "0".zfill(max_digits)
+        self.prefix_to_path[root_prefix] = "(root directory)"
+
+        # Store the root prefix format for use in filename generation
+        self.root_prefix = root_prefix
+
+        print(f"Built directory mapping for {len(sorted_dirs)} directories")
+        print(f"  {root_prefix} -> (root directory)")
+        for dir_path in sorted_dirs:
+            prefix = self.path_to_prefix[dir_path]
+            print(f"  {prefix} -> {dir_path}")
+
     def extract_archive(self, archive_path, temp_dir):
         """Extract archive to temporary directory."""
         archive_path = Path(archive_path)
@@ -157,7 +196,7 @@ class ArchiveExtractor:
             raise
 
     def get_unique_filename(self, original_name, source_path_str=""):
-        """Generate a unique filename using prepended path hash for deduplication."""
+        """Generate a unique filename using prepended ordered prefix for deduplication."""
         base_name = Path(original_name).stem
         extension = Path(original_name).suffix
 
@@ -165,40 +204,63 @@ class ArchiveExtractor:
         if extension.lower() in self.TXT_EXTENSIONS:
             extension += '.txt'
 
-        # Create filename with prepended path hash for deduplication
-        if source_path_str:
-            # Include hash of the source path for uniqueness (prepended)
-            path_hash = hashlib.md5(source_path_str.encode()).hexdigest()[:8]
-            unique_filename = f"{path_hash}_{base_name}{extension}"
-            # Store mapping for later reference
-            self.hash_to_path[path_hash] = source_path_str
+        # Create filename with prepended ordered prefix for deduplication
+        if source_path_str and source_path_str in self.path_to_prefix:
+            # Use ordered prefix to maintain alphabetical directory ordering
+            prefix = self.path_to_prefix[source_path_str]
+            base_filename = f"{prefix}_{base_name}{extension}"
         else:
-            # For files in root directory, use original name
-            unique_filename = f"{base_name}{extension}"
+            # For files in root directory, use "0" prefix to ensure they come first
+            base_filename = f"{self.root_prefix}_{base_name}{extension}"
 
+        # Resolve conflicts by adding counter suffix if needed
+        unique_filename = self._resolve_filename_conflict(base_filename)
         return unique_filename
 
+    def _resolve_filename_conflict(self, proposed_filename):
+        """Resolve filename conflicts by adding a counter suffix."""
+        if proposed_filename not in self.used_filenames:
+            self.used_filenames.add(proposed_filename)
+            return proposed_filename
+
+        # Extract base name and extension for conflict resolution
+        path_obj = Path(proposed_filename)
+        base_name = path_obj.stem
+        extension = path_obj.suffix
+
+        # Try adding counter suffixes until we find an unused name
+        counter = 1
+        while True:
+            conflict_filename = f"{base_name}_{counter:03d}{extension}"
+            if conflict_filename not in self.used_filenames:
+                self.used_filenames.add(conflict_filename)
+                return conflict_filename
+            counter += 1
+
     def write_mapping_file(self):
-        """Write hash-to-path mapping to auxiliary file."""
-        if not self.hash_to_path:
+        """Write prefix-to-path mapping to auxiliary file."""
+        # Ensure root directory mapping is always included
+        if self.root_prefix not in self.prefix_to_path:
+            self.prefix_to_path[self.root_prefix] = "(root directory)"
+
+        if not self.prefix_to_path:
             return
 
         mapping_file = self.output_dir / ".path_mappings.txt"
 
         with open(mapping_file, 'w', encoding='utf-8') as f:
-            f.write("# Hash to Source Path Mapping\n")
-            f.write("# Generated by extract_flatten.py\n")
-            f.write("# Format: HASH -> SOURCE_PATH\n\n")
+            f.write("# PREFIX -> SOURCE_PATH\n\n")
 
-            for path_hash, source_path in sorted(self.hash_to_path.items()):
-                f.write(f"{path_hash} -> {source_path}\n")
+            # Write ALL mappings to file (no truncation) - sorted by prefix to maintain directory order
+            for prefix, source_path in sorted(self.prefix_to_path.items()):
+                f.write(f"{prefix} -> {source_path}\n")
 
-        print(f"\nPath mapping written to: {mapping_file}")
+        print(f"\nPath mapping written to: {mapping_file} (contains all {len(self.prefix_to_path)} mappings)")
 
-        # Also print the mappings to console
-        print("\nHash to Path Mappings:")
-        for path_hash, source_path in sorted(self.hash_to_path.items()):
-            print(f"  {path_hash} -> {source_path}")
+        # Also print all mappings to console
+        print("\nPrefix to Path Mappings:")
+        for prefix, source_path in sorted(self.prefix_to_path.items()):
+            print(f"  {prefix} -> {source_path}")
 
     def _should_skip_file(self, file_path):
         """Check if file should be skipped (e.g., empty files, OS metadata files)."""
@@ -246,13 +308,13 @@ class ArchiveExtractor:
         if not self._should_consolidate_file(file_path.name):
             return False
 
-        # Group by directory (using hash_prefix as key)
-        hash_prefix = hashlib.md5(source_path_str.encode()).hexdigest()[:8] if source_path_str else "root"
+        # Group by directory (using ordered prefix as key)
+        group_key = self.path_to_prefix.get(source_path_str, "root") if source_path_str else "root"
 
-        if hash_prefix not in self.consolidation_groups:
-            self.consolidation_groups[hash_prefix] = []
+        if group_key not in self.consolidation_groups:
+            self.consolidation_groups[group_key] = []
 
-        self.consolidation_groups[hash_prefix].append({
+        self.consolidation_groups[group_key].append({
             'file_path': file_path,
             'source_path_str': source_path_str,
             'unique_name': unique_name,
@@ -265,7 +327,7 @@ class ArchiveExtractor:
         """Create consolidated files from groups."""
         consolidated_count = 0
 
-        for hash_prefix, files in self.consolidation_groups.items():
+        for group_key, files in self.consolidation_groups.items():
             if len(files) <= 1:
                 # Single file, process normally
                 file_info = files[0]
@@ -274,10 +336,10 @@ class ArchiveExtractor:
                 continue
 
             # Multiple files, create consolidated file
-            if hash_prefix == "root":
+            if group_key == "root":
                 consolidated_name = "CONSOLIDATED_LOGS.log.txt"
             else:
-                consolidated_name = f"{hash_prefix}_CONSOLIDATED_LOGS.log.txt"
+                consolidated_name = f"{group_key}_CONSOLIDATED_LOGS.log.txt"
 
             consolidated_path = self.output_dir / consolidated_name
 
@@ -362,6 +424,9 @@ class ArchiveExtractor:
         print(f"Processing files from {source_dir}...")
         print(f"Recursively scanning all subdirectories...")
 
+        # Build directory mapping first to preserve alphabetical order
+        self._build_directory_mapping(source_dir)
+
         # Use rglob to recursively find all files in subdirectories
         for file_path in source_dir.rglob('*'):
             if file_path.is_file():
@@ -440,15 +505,15 @@ Files with these extensions will get .txt appended:
 
 Consolidation (-c flag):
   - Consolidates all .log and .previous.log files within each subdirectory
-  - Creates files named: CONSOLIDATED_LOGS.log.txt (root) or {hash}_CONSOLIDATED_LOGS.log.txt (subdirs)
+  - Creates files named: CONSOLIDATED_LOGS.log.txt (root) or {prefix}_CONSOLIDATED_LOGS.log.txt (subdirs)
   - Files are sorted alphabetically, with .previous.log appearing before .log for same base filename
   - Each file section is separated by: --- original/path/filename ---
   - Header shows count and list of included files
 
 Notes:
   - Output directory must be empty (script will abort if not)
-  - Hash-to-path mappings are saved to .path_mappings.txt
-  - File names are prefixed with 8-character path hashes for deduplication
+  - Prefix-to-path mappings are saved to .path_mappings.txt
+  - File names are prefixed with ordered numbers to preserve directory order
   - OS metadata files are automatically filtered out (macOS, Windows, Linux)
   - Consolidation groups files by subdirectory for logical organization
         """
