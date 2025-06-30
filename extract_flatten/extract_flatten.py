@@ -552,12 +552,8 @@ def main():
         extractor = ArchiveExtractor(args.source, args.output, args.consolidate)
         result = extractor.run()
 
-        # Handle different return formats for backward compatibility
-        if len(result) == 3:
-            processed, skipped, consolidated = result
-        else:
-            processed, skipped = result
-            consolidated = 0
+        # Unpack the 3-tuple result from process_files
+        processed, skipped, consolidated = result
 
         print(f"\nSummary:")
         print(f"  Files processed: {processed}")
