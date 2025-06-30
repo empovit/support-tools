@@ -128,17 +128,26 @@ class ArchiveExtractor:
             decompressed_path.unlink()
 
     def _build_directory_mapping(self, source_dir):
-        """Pre-scan directories and build ordered prefix mapping."""
+        """Pre-scan directories and build ordered prefix mapping, excluding metadata directories."""
         source_dir = Path(source_dir)
 
-        # Collect all unique directory paths
+        # Collect all unique directory paths, excluding metadata directories
         dir_paths = set()
+        skipped_dirs = set()
         for file_path in source_dir.rglob('*'):
             if file_path.is_file():
                 rel_path = file_path.relative_to(source_dir)
                 dir_path_str = str(rel_path.parent) if rel_path.parent != Path('.') else ""
-                if dir_path_str:  # Only add non-empty paths
-                    dir_paths.add(dir_path_str)
+                if dir_path_str:
+                    # Use shared metadata detection logic
+                    path_parts = dir_path_str.split('/')
+                    if self._is_metadata_path(path_parts):
+                        skipped_dirs.add(dir_path_str)
+                    else:
+                        dir_paths.add(dir_path_str)
+
+        if skipped_dirs:
+            print(f"Skipping {len(skipped_dirs)} metadata directories: {', '.join(sorted(skipped_dirs))}")
 
         # Sort directory paths alphabetically
         sorted_dirs = sorted(dir_paths)
@@ -262,6 +271,25 @@ class ArchiveExtractor:
         for prefix, source_path in sorted(self.prefix_to_path.items()):
             print(f"  {prefix} -> {source_path}")
 
+    def _is_metadata_path(self, path_parts):
+        """Check if path contains metadata directories or files that should be skipped."""
+        # Skip macOS metadata paths
+        if '__MACOSX' in path_parts:
+            return True
+
+        # Skip Windows recycle bin paths
+        if '$RECYCLE.BIN' in path_parts:
+            return True
+
+        # Skip any path component that starts with common metadata patterns
+        for part in path_parts:
+            if part.startswith('._'):  # AppleDouble files/directories
+                return True
+            if part in {'.Trashes', '.fseventsd', '.Spotlight-V100', '.TemporaryItems'}:
+                return True
+
+        return False
+
     def _should_skip_file(self, file_path):
         """Check if file should be skipped (e.g., empty files, OS metadata files)."""
         # Skip empty files
@@ -272,26 +300,14 @@ class ArchiveExtractor:
         file_name = file_path.name
         path_parts = file_path.parts
 
-        # Skip macOS metadata files
-        if '__MACOSX' in path_parts:
+        # Check for metadata paths using shared logic
+        if self._is_metadata_path(path_parts):
             return True
 
-        # Skip AppleDouble files (resource forks)
-        if file_name.startswith('._'):
-            return True
-
-        # Skip common macOS system files
-        macos_files = {'.DS_Store', '.Trashes', '.fseventsd', '.Spotlight-V100', '.TemporaryItems'}
-        if file_name in macos_files:
-            return True
-
-        # Skip Windows system files
-        windows_files = {'Thumbs.db', 'desktop.ini', '$RECYCLE.BIN'}
-        if file_name in windows_files:
-            return True
-
-        # Skip Linux system files
-        if file_name == '.directory':  # KDE folder settings
+        # Skip common system files
+        system_files = {'.DS_Store', '.Trashes', '.fseventsd', '.Spotlight-V100', '.TemporaryItems',
+                       'Thumbs.db', 'desktop.ini', '.directory'}
+        if file_name in system_files:
             return True
 
         return False
