@@ -169,12 +169,12 @@ class ArchiveExtractor:
         if source_path_str:
             # Include hash of the source path for uniqueness (prepended)
             path_hash = hashlib.md5(source_path_str.encode()).hexdigest()[:8]
-            unique_filename = f"{path_hash}_{base_name}{extension}"
+            unique_filename = f"must-gather_{path_hash}_{base_name}{extension}"
             # Store mapping for later reference
             self.hash_to_path[path_hash] = source_path_str
         else:
             # For files in root directory, use original name
-            unique_filename = f"{base_name}{extension}"
+            unique_filename = f"must-gather_{base_name}{extension}"
 
         return unique_filename
 
@@ -275,9 +275,9 @@ class ArchiveExtractor:
 
             # Multiple files, create consolidated file
             if hash_prefix == "root":
-                consolidated_name = "CONSOLIDATED_LOGS.log.txt"
+                consolidated_name = "must-gather_CONSOLIDATED_LOGS.log.txt"
             else:
-                consolidated_name = f"{hash_prefix}_CONSOLIDATED_LOGS.log.txt"
+                consolidated_name = f"must-gather_{hash_prefix}_CONSOLIDATED_LOGS.log.txt"
 
             consolidated_path = self.output_dir / consolidated_name
 
