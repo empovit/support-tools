@@ -26,7 +26,6 @@ from pathlib import Path
 try:
     import py7zr
     HAS_7Z = True
-except ImportError:
     HAS_7Z = False
 
 try:
@@ -42,10 +41,11 @@ class ArchiveExtractor:
     # Extensions that should get .txt appended
     TXT_EXTENSIONS = {'.yaml', '.yml', '.list', '.log', '.descr', '.status', '.labels'}
 
-    def __init__(self, source_path, output_dir, consolidate=False):
+    def __init__(self, source_path, output_dir, consolidate=False, max_file_size_mb=1):
         self.source_path = Path(source_path)
         self.output_dir = Path(output_dir)
         self.consolidate = consolidate
+        self.max_file_size = max_file_size_mb * 1024 * 1024  # Convert MB to bytes
         self.consolidation_groups = {}  # Track files for consolidation
 
         # Check if output directory exists and is not empty
@@ -200,6 +200,68 @@ class ArchiveExtractor:
         for path_hash, source_path in sorted(self.hash_to_path.items()):
             print(f"  {path_hash} -> {source_path}")
 
+    def _split_large_file(self, file_path):
+        """Split files larger than max_file_size into smaller chunks."""
+        file_path = Path(file_path)
+        
+        # Check if file exists and is larger than max size
+        if not file_path.exists():
+            return []
+            
+        file_size = file_path.stat().st_size
+        if file_size <= self.max_file_size:
+            return [file_path]  # No splitting needed
+        
+        print(f"Splitting large file: {file_path.name} ({file_size / (1024*1024):.1f} MB)")
+        
+        # Calculate number of parts needed
+        num_parts = (file_size + self.max_file_size - 1) // self.max_file_size
+        
+        # Generate part filenames
+        base_name = file_path.stem
+        extension = file_path.suffix
+        part_files = []
+        
+        # Read and split the file
+        try:
+            with open(file_path, 'rb') as source_file:
+                for part_num in range(1, num_parts + 1):
+                    part_filename = f"{base_name}.part{part_num:03d}{extension}"
+                    part_path = file_path.parent / part_filename
+                    
+                    with open(part_path, 'wb') as part_file:
+                        remaining_bytes = min(self.max_file_size, file_size - (part_num - 1) * self.max_file_size)
+                        
+                        # Copy data in chunks to avoid memory issues
+                        bytes_written = 0
+                        chunk_size = 64 * 1024  # 64KB chunks
+                        
+                        while bytes_written < remaining_bytes:
+                            chunk_size_to_read = min(chunk_size, remaining_bytes - bytes_written)
+                            chunk = source_file.read(chunk_size_to_read)
+                            if not chunk:
+                                break
+                            part_file.write(chunk)
+                            bytes_written += len(chunk)
+                    
+                    part_files.append(part_path)
+                    print(f"  Created: {part_filename} ({part_path.stat().st_size / (1024*1024):.1f} MB)")
+            
+            # Remove the original large file
+            file_path.unlink()
+            print(f"  Removed original file: {file_path.name}")
+            print(f"  Split into {num_parts} parts")
+            
+            return part_files
+            
+        except Exception as e:
+            print(f"Error splitting file {file_path}: {e}")
+            # Clean up any partial files created
+            for part_file in part_files:
+                if part_file.exists():
+                    part_file.unlink()
+            return [file_path]  # Return original file if splitting failed
+
     def _should_skip_file(self, file_path):
         """Check if file should be skipped (e.g., empty files, OS metadata files)."""
         # Skip empty files
@@ -327,7 +389,12 @@ class ArchiveExtractor:
                     if i < len(sorted_files) - 1:  # Don't add separator after last file
                         consolidated_file.write(f"\n\n")
 
-            print(f"Consolidated: {len(files)} log files -> {consolidated_name}")
+            # Check if consolidated file needs to be split
+            split_files = self._split_large_file(consolidated_path)
+            if len(split_files) > 1:
+                print(f"Consolidated and split: {len(files)} log files -> {consolidated_name} ({len(split_files)} parts)")
+            else:
+                print(f"Consolidated: {len(files)} log files -> {consolidated_name}")
             consolidated_count += len(files)
 
         return consolidated_count
@@ -348,7 +415,13 @@ class ArchiveExtractor:
             # Process normally (copy directly)
             dest_path = self.output_dir / unique_name
             shutil.copy2(file_path, dest_path)
-            print(f"Processed: {rel_path} -> {unique_name}")
+            
+            # Check if file needs to be split
+            split_files = self._split_large_file(dest_path)
+            if len(split_files) > 1:
+                print(f"Processed and split: {rel_path} -> {len(split_files)} parts")
+            else:
+                print(f"Processed: {rel_path} -> {unique_name}")
 
         if files_processed % 100 == 0:
             print(f"Processed {files_processed} files...")
@@ -427,6 +500,7 @@ Examples:
   %(prog)s --source archive.tar.gz --output ./extracted
   %(prog)s -s ~/docs -o ./flattened -v
   %(prog)s -s logs.tar.gz -o logs-flat -c  # Enable consolidation
+  %(prog)s -s archive.zip -o output -m 5   # Split files larger than 5MB
 
 Supported archive formats:
   - ZIP (.zip)
@@ -451,12 +525,15 @@ Notes:
   - File names are prefixed with 8-character path hashes for deduplication
   - OS metadata files are automatically filtered out (macOS, Windows, Linux)
   - Consolidation groups files by subdirectory for logical organization
+  - Files larger than specified size will be split into smaller parts (.part001, .part002, etc.)
+  - Split parts maintain the original file extension and must-gather prefix
         """
     )
 
     parser.add_argument('-s', '--source', required=True, metavar='SRC', help='Source directory or archive file')
     parser.add_argument('-o', '--output', required=True, metavar='OUT', help='Output directory for flattened files')
     parser.add_argument('-c', '--consolidate', action='store_true', help='Consolidate all .log and .previous.log files in each subdirectory')
+    parser.add_argument('-m', '--max-size', type=int, default=1, metavar='MB', help='Maximum file size in MB before splitting (default: 1)')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
 
     return parser
@@ -468,7 +545,7 @@ def main():
     args = parser.parse_args()
 
     try:
-        extractor = ArchiveExtractor(args.source, args.output, args.consolidate)
+        extractor = ArchiveExtractor(args.source, args.output, args.consolidate, args.max_size)
         result = extractor.run()
 
         # Handle different return formats for backward compatibility
