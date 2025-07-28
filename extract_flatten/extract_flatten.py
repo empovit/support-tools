@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Archive/Directory Flattener Script
+This tool extracts files from a must-gather archive or directory structure
+into a single, flat directory, and changes the extension of common manifest
+and log files to .txt so they can be used with AI tools.
 
-This script takes either a directory or an archive file as input and:
-1. Extracts all files recursively into a flat directory structure
-2. Deduplicates filenames using prepended path hashes
-3. Adds .txt extension to specific file types
-4. Skips empty files and OS metadata files
-5. Supports popular Linux archive formats
-6. Creates mapping file showing hash-to-path relationships
-7. Aborts if output directory is not empty
+BASIC USAGE:
+    python extract_flatten.py -s input.zip -o output_folder
+    python extract_flatten.py -s /path/to/directory -o flattened_files
+
+The output directory must be empty to prevent accidental overwrites.
+Run with --help for detailed options and examples.
+
+More information: https://github.com/empovit/support-tools/tree/main/extract_flatten
 """
 
 import sys
