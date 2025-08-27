@@ -44,11 +44,9 @@ class ArchiveExtractor:
     # Extensions that should get .txt appended
     TXT_EXTENSIONS = {'.yaml', '.yml', '.list', '.log', '.descr', '.status', '.labels'}
 
-    def __init__(self, source_path, output_dir, consolidate=False):
+    def __init__(self, source_path, output_dir):
         self.source_path = Path(source_path)
         self.output_dir = Path(output_dir)
-        self.consolidate = consolidate
-        self.consolidation_groups = {}  # Track files for consolidation
 
         # Check if output directory exists and is not empty
         if self.output_dir.exists():
@@ -236,106 +234,8 @@ class ArchiveExtractor:
 
         return False
 
-    def _should_consolidate_file(self, filename):
-        """Check if file should be consolidated (.log and .previous.log files)."""
-        if not self.consolidate:
-            return False
-
-        return filename.lower().endswith('.log') or filename.lower().endswith('.previous.log')
-
-    def _add_to_consolidation_group(self, file_path, source_path_str, unique_name):
-        """Add file to consolidation group if applicable."""
-        if not self._should_consolidate_file(file_path.name):
-            return False
-
-        # Group by directory (using hash_prefix as key)
-        hash_prefix = hashlib.md5(source_path_str.encode()).hexdigest()[:8] if source_path_str else "root"
-
-        if hash_prefix not in self.consolidation_groups:
-            self.consolidation_groups[hash_prefix] = []
-
-        self.consolidation_groups[hash_prefix].append({
-            'file_path': file_path,
-            'source_path_str': source_path_str,
-            'unique_name': unique_name,
-            'original_name': file_path.name
-        })
-
-        return True
-
-    def _create_consolidated_files(self):
-        """Create consolidated files from groups."""
-        consolidated_count = 0
-
-        for hash_prefix, files in self.consolidation_groups.items():
-            if len(files) <= 1:
-                # Single file, process normally
-                file_info = files[0]
-                dest_path = self.output_dir / file_info['unique_name']
-                shutil.copy2(file_info['file_path'], dest_path)
-                continue
-
-            # Multiple files, create consolidated file
-            if hash_prefix == "root":
-                consolidated_name = "CONSOLIDATED_LOGS.log.txt"
-            else:
-                consolidated_name = f"{hash_prefix}_CONSOLIDATED_LOGS.log.txt"
-
-            consolidated_path = self.output_dir / consolidated_name
-
-            # Sort files alphabetically by their full path
-            sorted_files = sorted(files, key=lambda f: f"{f['source_path_str'] or ''}/{f['original_name']}")
-
-            # Custom sort to put .previous.log before .log for same base filename
-            def sort_key(file_info):
-                full_path = f"{file_info['source_path_str'] or ''}/{file_info['original_name']}"
-                filename = file_info['original_name']
-
-                # Extract base name without .log or .previous.log
-                if filename.endswith('.previous.log'):
-                    base_name = filename[:-len('.previous.log')]
-                    priority = 0  # .previous.log comes first
-                elif filename.endswith('.log'):
-                    base_name = filename[:-len('.log')]
-                    priority = 1  # .log comes second
-                else:
-                    base_name = filename
-                    priority = 2  # other files come last
-
-                return (full_path.rsplit('/', 1)[0] if '/' in full_path else '', base_name, priority)
-
-            sorted_files = sorted(files, key=sort_key)
-
-            # Create consolidated file
-            with open(consolidated_path, 'w', encoding='utf-8', errors='replace') as consolidated_file:
-                consolidated_file.write(f"# Contains {len(files)} log files:\n")
-                for file_info in sorted_files:
-                    full_path = f"{file_info['source_path_str']}/{file_info['original_name']}" if file_info['source_path_str'] else file_info['original_name']
-                    consolidated_file.write(f"#   {full_path}\n")
-                consolidated_file.write("\n" + "="*80 + "\n\n")
-
-                for i, file_info in enumerate(sorted_files):
-                    # Simple separator with full file path
-                    full_path = f"{file_info['source_path_str']}/{file_info['original_name']}" if file_info['source_path_str'] else file_info['original_name']
-                    consolidated_file.write(f"--- {full_path} ---\n\n")
-
-                    try:
-                        with open(file_info['file_path'], 'r', encoding='utf-8', errors='replace') as source_file:
-                            content = source_file.read()
-                            consolidated_file.write(content)
-                    except Exception as e:
-                        consolidated_file.write(f"[ERROR: Could not read file content: {e}]\n")
-
-                    if i < len(sorted_files) - 1:  # Don't add separator after last file
-                        consolidated_file.write(f"\n\n")
-
-            print(f"Consolidated: {len(files)} log files -> {consolidated_name}")
-            consolidated_count += len(files)
-
-        return consolidated_count
-
     def _process_single_file(self, file_path, source_dir, files_processed):
-        """Process a single file - generate unique name and either copy or add to consolidation group."""
+        """Process a single file - generate unique name and copy to output directory."""
         # Get relative path for context
         rel_path = file_path.relative_to(source_dir)
         source_path_str = str(rel_path.parent) if rel_path.parent != Path('.') else ""
@@ -343,14 +243,10 @@ class ArchiveExtractor:
         # Generate unique filename
         unique_name = self.get_unique_filename(file_path.name, source_path_str)
 
-        # Try to add to consolidation group first
-        if self._add_to_consolidation_group(file_path, source_path_str, unique_name):
-            print(f"Queued for consolidation: {rel_path} -> {unique_name}")
-        else:
-            # Process normally (copy directly)
-            dest_path = self.output_dir / unique_name
-            shutil.copy2(file_path, dest_path)
-            print(f"Processed: {rel_path} -> {unique_name}")
+        # Copy file to output directory
+        dest_path = self.output_dir / unique_name
+        shutil.copy2(file_path, dest_path)
+        print(f"Processed: {rel_path} -> {unique_name}")
 
         if files_processed % 100 == 0:
             print(f"Processed {files_processed} files...")
@@ -384,18 +280,10 @@ class ArchiveExtractor:
 
         print(f"Processing complete: {files_processed} files processed, {files_skipped} files skipped")
 
-        # Create consolidated files if consolidation is enabled
-        consolidated_count = 0
-        if self.consolidate:
-            print(f"\nCreating consolidated files...")
-            consolidated_count = self._create_consolidated_files()
-            if consolidated_count > 0:
-                print(f"Consolidated {consolidated_count} files into groups")
-
         # Write mapping file
         self.write_mapping_file()
 
-        return files_processed, files_skipped, consolidated_count
+        return files_processed, files_skipped
 
     def run(self):
         """Main execution method."""
@@ -428,7 +316,6 @@ Examples:
   %(prog)s -s /path/to/directory -o output_dir
   %(prog)s --source archive.tar.gz --output ./extracted
   %(prog)s -s ~/docs -o ./flattened -v
-  %(prog)s -s logs.tar.gz -o logs-flat -c  # Enable consolidation
 
 Supported archive formats:
   - ZIP (.zip)
@@ -440,25 +327,16 @@ Supported archive formats:
 Files with these extensions will get .txt appended:
   yaml, yml, list, log, descr, status, labels
 
-Consolidation (-c flag):
-  - Consolidates all .log and .previous.log files within each subdirectory
-  - Creates files named: CONSOLIDATED_LOGS.log.txt (root) or {hash}_CONSOLIDATED_LOGS.log.txt (subdirs)
-  - Files are sorted alphabetically, with .previous.log appearing before .log for same base filename
-  - Each file section is separated by: --- original/path/filename ---
-  - Header shows count and list of included files
-
 Notes:
   - Output directory must be empty (script will abort if not)
   - Hash-to-path mappings are saved to .path_mappings.txt
   - File names are prefixed with 8-character path hashes for deduplication
   - OS metadata files are automatically filtered out (macOS, Windows, Linux)
-  - Consolidation groups files by subdirectory for logical organization
         """
     )
 
     parser.add_argument('-s', '--source', required=True, metavar='SRC', help='Source directory or archive file')
     parser.add_argument('-o', '--output', required=True, metavar='OUT', help='Output directory for flattened files')
-    parser.add_argument('-c', '--consolidate', action='store_true', help='Consolidate all .log and .previous.log files in each subdirectory')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
 
     return parser
@@ -470,21 +348,12 @@ def main():
     args = parser.parse_args()
 
     try:
-        extractor = ArchiveExtractor(args.source, args.output, args.consolidate)
-        result = extractor.run()
-
-        # Handle different return formats for backward compatibility
-        if len(result) == 3:
-            processed, skipped, consolidated = result
-        else:
-            processed, skipped = result
-            consolidated = 0
+        extractor = ArchiveExtractor(args.source, args.output)
+        processed, skipped = extractor.run()
 
         print(f"\nSummary:")
         print(f"  Files processed: {processed}")
         print(f"  Files skipped: {skipped}")
-        if consolidated > 0:
-            print(f"  Files consolidated: {consolidated}")
         print(f"  Output directory: {Path(args.output).absolute()}")
 
     except Exception as e:
