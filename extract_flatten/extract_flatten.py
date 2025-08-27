@@ -240,7 +240,7 @@ class ArchiveExtractor:
 
         return False
 
-    def _split_large_file(self, file_path, source_dir, max_chunk_size=3 * 1024 * 1024):
+    def _split_large_file(self, file_path, source_dir, max_chunk_size=2.9 * 1000 * 1000):
         """Split a large file into chunks using line boundaries."""
         rel_path = file_path.relative_to(source_dir)
         source_path_str = str(rel_path.parent) if rel_path.parent != Path('.') else ""
@@ -302,7 +302,7 @@ class ArchiveExtractor:
 
         # Check file size
         file_size = file_path.stat().st_size
-        max_chunk_size = 3 * 1024 * 1024  # 3 MB
+        max_chunk_size = 2.9 * 1000 * 1000
 
         if file_size > max_chunk_size:
             # Split large files into chunks
