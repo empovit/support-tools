@@ -156,7 +156,7 @@ class ArchiveExtractor:
             print(f"Error extracting {archive_path}: {e}")
             raise
 
-    def get_unique_filename(self, original_name, source_path_str=""):
+    def get_unique_filename(self, original_name, source_path_str="", part_num=None):
         """Generate a unique filename using prepended path hash for deduplication."""
         base_name = Path(original_name).stem
         extension = Path(original_name).suffix
@@ -169,12 +169,18 @@ class ArchiveExtractor:
         if source_path_str:
             # Include hash of the source path for uniqueness (prepended)
             path_hash = hashlib.md5(source_path_str.encode()).hexdigest()[:8]
-            unique_filename = f"{path_hash}_{base_name}{extension}"
+            if part_num is not None:
+                unique_filename = f"{path_hash}_{base_name}_part{part_num}{extension}"
+            else:
+                unique_filename = f"{path_hash}_{base_name}{extension}"
             # Store mapping for later reference
             self.hash_to_path[path_hash] = source_path_str
         else:
             # For files in root directory, use original name
-            unique_filename = f"{base_name}{extension}"
+            if part_num is not None:
+                unique_filename = f"{base_name}_part{part_num}{extension}"
+            else:
+                unique_filename = f"{base_name}{extension}"
 
         return unique_filename
 
@@ -234,28 +240,102 @@ class ArchiveExtractor:
 
         return False
 
+    def _split_large_file(self, file_path, source_dir, max_chunk_size=3 * 1024 * 1024):
+        """Split a large file into chunks using line boundaries."""
+        rel_path = file_path.relative_to(source_dir)
+        source_path_str = str(rel_path.parent) if rel_path.parent != Path('.') else ""
+
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                part_num = 1
+                current_chunk_size = 0
+                current_chunk_lines = []
+
+                for line in f:
+                    line_size = len(line.encode('utf-8'))
+
+                    # If adding this line would exceed the chunk size and we have lines in current chunk
+                    if current_chunk_size + line_size > max_chunk_size and current_chunk_lines:
+                        # Write current chunk
+                        unique_name = self.get_unique_filename(file_path.name, source_path_str, part_num)
+                        dest_path = self.output_dir / unique_name
+
+                        with open(dest_path, 'w', encoding='utf-8') as chunk_file:
+                            chunk_file.writelines(current_chunk_lines)
+
+                        print(f"Processed chunk {part_num}: {rel_path} -> {unique_name} ({current_chunk_size:,} bytes)")
+
+                        # Reset for next chunk
+                        part_num += 1
+                        current_chunk_lines = [line]
+                        current_chunk_size = line_size
+                    else:
+                        # Add line to current chunk
+                        current_chunk_lines.append(line)
+                        current_chunk_size += line_size
+
+                # Write the final chunk if there are remaining lines
+                if current_chunk_lines:
+                    unique_name = self.get_unique_filename(file_path.name, source_path_str, part_num)
+                    dest_path = self.output_dir / unique_name
+
+                    with open(dest_path, 'w', encoding='utf-8') as chunk_file:
+                        chunk_file.writelines(current_chunk_lines)
+
+                    print(f"Processed chunk {part_num}: {rel_path} -> {unique_name} ({current_chunk_size:,} bytes)")
+
+                return part_num  # Return number of chunks created
+
+        except (UnicodeDecodeError, Exception):
+            # File cannot be split by line boundaries, return None to indicate failure
+            return None
+
     def _process_single_file(self, file_path, source_dir, files_processed):
-        """Process a single file - generate unique name and copy to output directory."""
+        """Process a single file - generate unique name and copy to output directory.
+
+        Returns:
+            bool: True if the file was split into chunks, False if copied as whole file
+        """
         # Get relative path for context
         rel_path = file_path.relative_to(source_dir)
         source_path_str = str(rel_path.parent) if rel_path.parent != Path('.') else ""
 
-        # Generate unique filename
-        unique_name = self.get_unique_filename(file_path.name, source_path_str)
+        # Check file size
+        file_size = file_path.stat().st_size
+        max_chunk_size = 3 * 1024 * 1024  # 3 MB
 
-        # Copy file to output directory
-        dest_path = self.output_dir / unique_name
-        shutil.copy2(file_path, dest_path)
-        print(f"Processed: {rel_path} -> {unique_name}")
+        if file_size > max_chunk_size:
+            # Split large files into chunks
+            print(f"File {rel_path} is {file_size:,} bytes, splitting into chunks...")
+            num_chunks = self._split_large_file(file_path, source_dir, max_chunk_size)
 
-        if files_processed % 100 == 0:
-            print(f"Processed {files_processed} files...")
+            if num_chunks is None:
+                # File cannot be split by line boundaries, copy entire file with warning
+                print(f"WARNING: Cannot split {rel_path} by line boundaries - copying entire file ({file_size:,} bytes)")
+                unique_name = self.get_unique_filename(file_path.name, source_path_str)
+                dest_path = self.output_dir / unique_name
+                shutil.copy2(file_path, dest_path)
+                print(f"Processed (unsplit): {rel_path} -> {unique_name}")
+                return False  # File was not split
+            else:
+                print(f"Split {rel_path} into {num_chunks} chunks")
+                return True  # File was split
+        else:
+            # Generate unique filename
+            unique_name = self.get_unique_filename(file_path.name, source_path_str)
+
+            # Copy file to output directory
+            dest_path = self.output_dir / unique_name
+            shutil.copy2(file_path, dest_path)
+            print(f"Processed: {rel_path} -> {unique_name}")
+            return False  # File was not split
 
     def process_files(self, source_dir):
         """Process all files in the source directory recursively."""
         source_dir = Path(source_dir)
         files_processed = 0
         files_skipped = 0
+        files_split = 0
 
         print(f"Processing files from {source_dir}...")
         print(f"Recursively scanning all subdirectories...")
@@ -271,19 +351,24 @@ class ArchiveExtractor:
                         continue
 
                     # Process the file
-                    self._process_single_file(file_path, source_dir, files_processed + 1)
+                    was_split = self._process_single_file(file_path, source_dir, files_processed + 1)
                     files_processed += 1
+                    if was_split:
+                        files_split += 1
+
+                    if files_processed % 100 == 0:
+                        print(f"Processed {files_processed} files...")
 
                 except Exception as e:
                     print(f"Error processing {file_path}: {e}")
                     files_skipped += 1
 
-        print(f"Processing complete: {files_processed} files processed, {files_skipped} files skipped")
+        print(f"Processing complete: {files_processed} files processed, {files_skipped} files skipped, {files_split} files split")
 
         # Write mapping file
         self.write_mapping_file()
 
-        return files_processed, files_skipped
+        return files_processed, files_skipped, files_split
 
     def run(self):
         """Main execution method."""
@@ -349,11 +434,12 @@ def main():
 
     try:
         extractor = ArchiveExtractor(args.source, args.output)
-        processed, skipped = extractor.run()
+        processed, skipped, split = extractor.run()
 
         print(f"\nSummary:")
         print(f"  Files processed: {processed}")
         print(f"  Files skipped: {skipped}")
+        print(f"  Files split: {split}")
         print(f"  Output directory: {Path(args.output).absolute()}")
 
     except Exception as e:
